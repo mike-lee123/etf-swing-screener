@@ -3,7 +3,7 @@ import json
 import re
 import time
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 import requests
@@ -203,7 +203,8 @@ def fetch_shioaji_daily(symbol: str, sj_api, lookback_days=180) -> pd.DataFrame:
         print(f"[SJ] {symbol} kbars error: {type(e).__name__}: {e}", flush=True)
     return pd.DataFrame()
 
-def download_yahoo_batch(symbols) -> dict:
+@st.cache_data(ttl=900, show_spinner=False)
+def download_yahoo_batch(symbols: tuple, period: str = "3y") -> dict:
     """Yahoo Finance 批次下載日 K；先試上市 .TW，抓不到的再試上櫃 .TWO"""
     result = {}
     pending = list(symbols)
@@ -212,7 +213,7 @@ def download_yahoo_batch(symbols) -> dict:
             break
         yf_tickers = [f"{s}{suffix}" for s in pending]
         try:
-            data = yf.download(yf_tickers, period="8mo", interval="1d", progress=False,
+            data = yf.download(yf_tickers, period=period, interval="1d", progress=False,
                                group_by="ticker", threads=True)
         except Exception as e:
             print(f"[YF] batch {suffix} error: {type(e).__name__}: {e}", flush=True)
@@ -228,21 +229,83 @@ def download_yahoo_batch(symbols) -> dict:
         pending = [s for s in pending if s not in result]
     return result
 
+@st.cache_data(ttl=900, show_spinner=False)
+def download_benchmark(period: str = "3y") -> pd.Series:
+    """大盤基準 (^TWII) 收盤價，用於計算相對強弱超額"""
+    bench_df = yf.download("^TWII", period=period, interval="1d", progress=False)
+    if isinstance(bench_df.columns, pd.MultiIndex):
+        bench_df.columns = bench_df.columns.get_level_values(0)
+    return bench_df['Close'].dropna()
+
 # ==============================================================================
-# 3. 量價與指標篩選管線 (帶 15 分鐘 Streamlit 快取保護)
+# 3. 量價與指標訊號 (即時篩選與歷史回測共用同一套規則)
 # ==============================================================================
+STATUS_LIST = ["🔥 強勢爆發", "⚡ 帶量突破", "⏳ 壓縮蓄勢", "📈 趨勢偏多"]
+SCREEN_PERIOD = "3y"   # 即時篩選與 2 年回測共用同一份下載資料 (含 60 日均線暖機期)
+TRADE_COST = 0.00585   # 來回交易成本：手續費 0.1425% x 2 + 證交稅 0.3%
+
+def compute_signals(df: pd.DataFrame, bench_close: pd.Series, target_vol_ratio: float,
+                    rs_window: int = 20) -> pd.DataFrame:
+    """逐日計算訊號狀態與停損點位，最後一列即為今日訊號"""
+    close, volume, low = df['Close'], df['Volume'], df['Low']
+
+    # 計算均線
+    ma20 = close.rolling(20).mean()
+    ma60 = close.rolling(60).mean()
+    prev_vol_ma5 = volume.rolling(5).mean().shift(1)
+
+    # --- 1. 趨勢基本過濾 (收盤站穩月線，季線走平或翻揚) ---
+    ma60_slope_up = ma60 >= ma60.shift(4) * 0.998
+    cond_trend = (close >= ma20) & (close >= ma60) & ma60_slope_up
+
+    # --- 2. 相對強弱指標 (RS)，容許落後大盤在 2% 以內 ---
+    stock_rs = close / close.shift(rs_window - 1) - 1
+    bench_rs = (bench_close / bench_close.shift(rs_window - 1) - 1).reindex(close.index).ffill()
+    rs_excess = stock_rs - bench_rs
+    cond_base = cond_trend & (rs_excess >= -0.02)
+
+    # --- 3. 布林通道帶寬收斂評估 ---
+    bandwidth = 4 * close.rolling(20).std() / ma20
+    is_bw_compressed = bandwidth <= bandwidth.rolling(60).min() * 1.30
+    is_bw_turning = bandwidth > bandwidth.shift(1)
+
+    # --- 4. 動態量能判定 ---
+    vol_multiple = (volume / prev_vol_ma5).where(prev_vol_ma5 > 0, 1.0)
+    cond_vol = volume >= prev_vol_ma5 * target_vol_ratio
+
+    # --- 5. 訊號階梯分級 ---
+    status = np.select(
+        [cond_base & cond_vol & is_bw_turning, cond_base & cond_vol,
+         cond_base & is_bw_compressed, cond_base & (rs_excess > 0)],
+        STATUS_LIST, default=""
+    )
+
+    # 關鍵支撐與停損點位 (取較高者，單筆最大虧損控制在 6% 以內)
+    key_support = np.maximum(low.rolling(10).min(), ma20)
+    stop_loss = np.maximum(key_support * 0.985, close * 0.94)
+
+    return pd.DataFrame({
+        "status": status, "rs_excess": rs_excess, "vol_multiple": vol_multiple,
+        "key_support": key_support, "stop_loss": stop_loss
+    }, index=close.index)
+
+def describe_trigger(status: str, vol_multiple: float) -> str:
+    return {
+        "🔥 強勢爆發": f"爆量({round(vol_multiple, 1)}x)+布林張口",
+        "⚡ 帶量突破": f"量增突破({round(vol_multiple, 1)}x)",
+        "⏳ 壓縮蓄勢": "布林極致壓縮(待量)",
+        "📈 趨勢偏多": "均線多頭+RS強",
+    }[status]
+
+def target_vol_ratio_for(sym: str, stock_tags: dict, min_vol_ratio: float) -> float:
+    # 核心權值門檻較為平緩
+    return 1.2 if "核心權值" in stock_tags.get(sym, []) else min_vol_ratio
+
 @st.cache_data(ttl=900, show_spinner=False)
 def run_screening_pipeline(_sj_api, data_source: str, min_vol_ratio: float, rs_window: int = 20):
     # data_source 參與快取鍵 (_sj_api 不參與)，讓 Yahoo 與永豐的結果分開快取
     tickers, stock_tags, stock_names, stock_etfs = get_etf_universe()
-
-    # 下載大盤基準 (^TWII) 計算相對強弱超額
-    cooldown_manager.wait()
-    bench_df = yf.download("^TWII", period="8mo", interval="1d", progress=False)
-    if isinstance(bench_df.columns, pd.MultiIndex):
-        bench_df.columns = bench_df.columns.get_level_values(0)
-    bench_close = bench_df['Close'].dropna()
-    bench_rs = (bench_close.iloc[-1] / bench_close.iloc[-rs_window] - 1) if len(bench_close) >= rs_window else 0
+    bench_close = download_benchmark(SCREEN_PERIOD)
 
     results = []
     progress_bar = st.progress(0)
@@ -259,93 +322,30 @@ def run_screening_pipeline(_sj_api, data_source: str, min_vol_ratio: float, rs_w
     missing = [s for s in tickers if s not in price_data]
     if missing:
         progress_bar.progress(1.0, text=f"Yahoo Finance 批次下載 {len(missing)} 檔...")
-        price_data.update(download_yahoo_batch(missing))
+        yahoo_data = download_yahoo_batch(tuple(tickers), SCREEN_PERIOD)
+        price_data.update({s: yahoo_data[s] for s in missing if s in yahoo_data})
 
-    for idx, sym in enumerate(tickers):
+    for sym in tickers:
         df = price_data.get(sym, pd.DataFrame())
-
         if df.empty or len(df) < 70:
             continue
 
-        close = df['Close']
-        volume = df['Volume']
-        low = df['Low']
-
-        # 計算均線
-        ma20 = close.rolling(20).mean()
-        ma60 = close.rolling(60).mean()
-        vol_ma5 = volume.rolling(5).mean()
-
-        curr_close = float(close.iloc[-1])
-        curr_vol = float(volume.iloc[-1])
-        prev_vol_ma5 = float(vol_ma5.iloc[-2]) if len(vol_ma5) >= 2 else 1.0
-
-        # --- 1. 趨勢基本過濾 (收盤站穩月線，季線走平或翻揚) ---
-        ma60_slope_up = ma60.iloc[-1] >= (ma60.iloc[-5] * 0.998)
-        cond_trend = (curr_close >= ma20.iloc[-1]) and (curr_close >= ma60.iloc[-1]) and ma60_slope_up
-
-        if not cond_trend:
+        today = compute_signals(df, bench_close, target_vol_ratio_for(sym, stock_tags, min_vol_ratio), rs_window).iloc[-1]
+        if not today["status"]:
             continue
-
-        # --- 2. 相對強弱指標 (RS) ---
-        stock_rs = (curr_close / close.iloc[-rs_window] - 1)
-        rs_excess = stock_rs - bench_rs
-        if rs_excess < -0.02:  # 容許落後大盤在 2% 以內
-            continue
-
-        # --- 3. 布林通道帶寬收斂評估 ---
-        std20 = close.rolling(20).std()
-        bandwidth = ((ma20 + std20 * 2) - (ma20 - std20 * 2)) / ma20
-        min_bw_60 = bandwidth.iloc[-60:].min()
-        is_bw_compressed = bandwidth.iloc[-1] <= (min_bw_60 * 1.30)
-        is_bw_turning = bandwidth.iloc[-1] > bandwidth.iloc[-2]
-
-        # --- 4. 動態量能判定 (核心權值門檻較為平緩) ---
-        tags_str = " / ".join(stock_tags.get(sym, ["一般"]))
-        target_vol_ratio = 1.2 if "核心權值" in tags_str else min_vol_ratio
-        cond_vol = curr_vol >= (prev_vol_ma5 * target_vol_ratio)
-
-        # --- 5. 訊號階梯分級 ---
-        status = None
-        triggers = []
-        vol_multiple = curr_vol / prev_vol_ma5 if prev_vol_ma5 > 0 else 1.0
-
-        if cond_vol and is_bw_turning:
-            status = "🔥 強勢爆發"
-            triggers.append(f"爆量({round(vol_multiple, 1)}x)+布林張口")
-        elif cond_vol:
-            status = "⚡ 帶量突破"
-            triggers.append(f"量增突破({round(vol_multiple, 1)}x)")
-        elif is_bw_compressed:
-            status = "⏳ 壓縮蓄勢"
-            triggers.append("布林極致壓縮(待量)")
-        elif rs_excess > 0:
-            status = "📈 趨勢偏多"
-            triggers.append("均線多頭+RS強")
-
-        if not status:
-            continue
-
-        # 關鍵支撐與停損點位
-        recent_swing_low = float(low.iloc[-10:].min())
-        key_support = max(recent_swing_low, float(ma20.iloc[-1]))
-        suggested_stop_loss = min(key_support * 0.985, curr_close * 0.94)
-
-        # 股票中文名稱
-        stock_name = stock_names.get(sym, sym)
 
         results.append({
             "代碼": sym,
-            "名稱": stock_name,
-            "狀態": status,
-            "所屬層級": tags_str,
+            "名稱": stock_names.get(sym, sym),
+            "狀態": today["status"],
+            "所屬層級": " / ".join(stock_tags.get(sym, ["一般"])),
             "持有ETF": " / ".join(stock_etfs.get(sym, [])),
-            "收盤價": round(curr_close, 2),
-            "20日超額RS(%)": round(float(rs_excess) * 100, 2),
-            "成交量比率": round(vol_multiple, 2),
-            "發動特徵": " + ".join(triggers),
-            "關鍵支撐": round(key_support, 2),
-            "建議停損點": round(suggested_stop_loss, 2)
+            "收盤價": round(float(df['Close'].iloc[-1]), 2),
+            "20日超額RS(%)": round(float(today["rs_excess"]) * 100, 2),
+            "成交量比率": round(float(today["vol_multiple"]), 2),
+            "發動特徵": describe_trigger(today["status"], float(today["vol_multiple"])),
+            "關鍵支撐": round(float(today["key_support"]), 2),
+            "建議停損點": round(float(today["stop_loss"]), 2)
         })
 
     progress_bar.empty()
@@ -358,7 +358,94 @@ def run_screening_pipeline(_sj_api, data_source: str, min_vol_ratio: float, rs_w
     return res_df
 
 # ==============================================================================
-# 4. Streamlit 介面主體與狀態控制
+# 4. 歷史回測：逐檔模擬「訊號隔日開盤進場 → 先觸停利算贏、先觸停損算輸」
+# ==============================================================================
+def simulate_trades(df: pd.DataFrame, signals: pd.DataFrame, start: pd.Timestamp,
+                    take_profit: float, max_hold: int) -> list:
+    """回傳 [(訊號狀態, 是否獲勝, 扣成本報酬)]；持倉期間不重複進場，未走完的交易不計入"""
+    opens, highs, lows, closes = (df[k].to_numpy() for k in ("Open", "High", "Low", "Close"))
+    status, stops = signals["status"].to_numpy(), signals["stop_loss"].to_numpy()
+    dates, n = df.index, len(df)
+    trades, i = [], 0
+    while i < n - 1:
+        if dates[i] < start or not status[i]:
+            i += 1
+            continue
+        entry_idx = i + 1
+        entry, stop = opens[entry_idx], stops[i]
+        if not (np.isfinite(stop) and entry > 0):
+            i += 1
+            continue
+        if entry <= stop:
+            # 隔日開盤即跳空跌破停損：進場即出場
+            trades.append((status[i], False, entry / entry - 1 - TRADE_COST))
+            i = entry_idx + 1
+            continue
+        target = entry * (1 + take_profit)
+        outcome, exit_idx = None, None
+        for j in range(entry_idx, min(entry_idx + max_hold, n)):
+            # 同一根 K 棒同時觸及停損與停利時，保守視為先觸停損
+            if lows[j] <= stop:
+                exit_px = min(opens[j], stop) if j > entry_idx else stop
+                outcome, exit_idx = (False, exit_px / entry - 1), j
+                break
+            if highs[j] >= target:
+                exit_px = max(opens[j], target) if j > entry_idx else target
+                outcome, exit_idx = (True, exit_px / entry - 1), j
+                break
+        if outcome is None:
+            if entry_idx + max_hold > n:
+                break  # 持有期尚未走完，不計入
+            exit_idx = entry_idx + max_hold - 1
+            ret = closes[exit_idx] / entry - 1
+            outcome = (ret > TRADE_COST, ret)  # 到期出場：扣成本後仍獲利算贏
+        trades.append((status[i], outcome[0], outcome[1] - TRADE_COST))
+        i = exit_idx + 1
+    return trades
+
+def wilson_lower_bound(wins: int, n: int, z: float = 1.96) -> float:
+    """勝率 95% 信賴下限：樣本少的高勝率會被打折，避免運氣好的少數幾筆排到最前面"""
+    if n == 0:
+        return 0.0
+    p = wins / n
+    return (p + z * z / (2 * n) - z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n))) / (1 + z * z / n)
+
+@st.cache_data(ttl=900, show_spinner=False)
+def run_backtest(min_vol_ratio: float, years: int, take_profit: float, max_hold: int) -> pd.DataFrame:
+    """全宇宙逐檔回測，回傳每檔個股整體與各訊號的交易統計"""
+    tickers, stock_tags, _, _ = get_etf_universe()
+    period = f"{years + 1}y"  # 多抓 1 年給均線暖機
+    price_data = download_yahoo_batch(tuple(tickers), period)
+    bench_close = download_benchmark(period)
+    start = pd.Timestamp.now() - pd.DateOffset(years=years)
+
+    rows = []
+    for sym, df in price_data.items():
+        if len(df) < 120:
+            continue
+        signals = compute_signals(df, bench_close, target_vol_ratio_for(sym, stock_tags, min_vol_ratio))
+        for status, win, ret in simulate_trades(df, signals, start, take_profit, max_hold):
+            rows.append({"代碼": sym, "訊號": status, "win": win, "ret": ret})
+    return pd.DataFrame(rows, columns=["代碼", "訊號", "win", "ret"])
+
+def summarize_backtest(trades: pd.DataFrame) -> pd.DataFrame:
+    if trades.empty:
+        return pd.DataFrame()
+    grouped = trades.groupby("代碼")
+    stats = pd.DataFrame({
+        "交易次數": grouped.size(),
+        "勝場": grouped["win"].sum().astype(int),
+        "平均報酬(%)": grouped["ret"].mean() * 100,
+        "總獲利": grouped["ret"].apply(lambda r: r[r > 0].sum()),
+        "總虧損": grouped["ret"].apply(lambda r: -r[r < 0].sum()),
+    })
+    stats["勝率(%)"] = stats["勝場"] / stats["交易次數"] * 100
+    stats["保守勝率(%)"] = [wilson_lower_bound(w, n) * 100 for w, n in zip(stats["勝場"], stats["交易次數"])]
+    stats["盈虧比"] = (stats["總獲利"] / stats["總虧損"].replace(0, np.nan)).fillna(99.0)
+    return stats.drop(columns=["總獲利", "總虧損"])
+
+# ==============================================================================
+# 5. Streamlit 介面主體與狀態控制
 # ==============================================================================
 st.title("📈 ETF 成分股多層波段選股儀表板")
 st.caption("涵蓋核心權值 (0050/0052/00935)、法人共識 (00981A/00982A) 與高彈性黑馬 (00733)")
@@ -426,9 +513,21 @@ with st.sidebar:
 
     top_candidates_count = st.slider("頂部精選展示檔數", 3, 8, 4)
 
+    with st.expander("🏆 回測勝率設定", expanded=False):
+        bt_years = st.selectbox("回測期間 (年)", [1, 2, 3], index=1)
+        bt_take_profit = st.slider("停利目標 (%)", 5, 20, 10) / 100
+        bt_max_hold = st.slider("最長持有天數", 5, 40, 20)
+        bt_min_trades = st.slider("最少訊號次數 (樣本不足者不列入)", 3, 15, 5)
+        bt_top_n = st.slider("勝率排行展示檔數", 10, 30, 20)
+
     if st.button("🔄 清除快取並重新掃描", width="stretch"):
         st.cache_data.clear()
         st.rerun()
+
+# 盤中執行時，今日 K 棒尚未收完 (成交量偏低、收盤價非最終價)，訊號可能失真
+_tw_now = datetime.now(timezone(timedelta(hours=8)))
+if _tw_now.weekday() < 5 and (9, 0) <= (_tw_now.hour, _tw_now.minute) < (13, 30):
+    st.warning(f"⏰ 目前為盤中 ({_tw_now:%H:%M})，今日成交量與收盤價尚未定案，量能與訊號可能失真，建議 13:30 收盤後再掃描。")
 
 # 執行管線
 with st.spinner("盤後量價與指標過濾管線執行中，請稍候..."):
@@ -450,7 +549,7 @@ if not screened_df.empty:
                 st.metric(
                     label=f"{row['代碼']} {row['名稱']} | {row['狀態']}",
                     value=f"{row['收盤價']} 元",
-                    delta=f"RS +{row['20日超額RS(%)']}%"
+                    delta=f"RS {row['20日超額RS(%)']:+.2f}%"
                 )
                 st.caption(f"🛡️ 停損: {row['建議停損點']} | 支撐: {row['關鍵支撐']}")
 
@@ -479,3 +578,62 @@ if not screened_df.empty:
         st.warning("篩選結果中沒有符合您所選勾選狀態（" + "、".join(selected_status) + "）的標的。請勾選更多狀態或調降量能倍數。")
 else:
     st.warning("目前市場無標的符合基礎趨勢條件。")
+
+# ==============================================================================
+# 6. 回測勝率排行：今日有訊號的標的中，依歷史回測勝率挑出前 N 名
+# ==============================================================================
+if not screened_df.empty:
+    st.markdown("---")
+    st.subheader(f"🏆 回測勝率排行 (Top {bt_top_n})")
+    st.caption(
+        f"回測近 {bt_years} 年：訊號出現隔日開盤進場，先觸及停利 +{bt_take_profit:.0%} 算贏、先觸及停損點算輸，"
+        f"最長持有 {bt_max_hold} 天後以收盤價出場；報酬已扣來回交易成本 {TRADE_COST:.3%}。"
+        f"依「保守勝率」(勝率 95% 信賴下限) 排序，交易次數少的高勝率會被打折。"
+    )
+
+    with st.spinner("歷史回測計算中..."):
+        bt_trades = run_backtest(vol_multiplier, bt_years, bt_take_profit, bt_max_hold)
+    bt_stats = summarize_backtest(bt_trades)
+
+    if bt_stats.empty:
+        st.warning("回測資料不足，無法計算勝率。")
+    else:
+        # 個股在「今日同一種訊號」下的歷史勝率，作為參考
+        same_status = bt_trades.merge(screened_df[["代碼", "狀態"]], left_on=["代碼", "訊號"], right_on=["代碼", "狀態"])
+        same_status_stats = same_status.groupby("代碼")["win"].agg(["mean", "size"])
+
+        ranking = screened_df.merge(bt_stats, left_on="代碼", right_index=True)
+        ranking = ranking[ranking["交易次數"] >= bt_min_trades]
+        ranking = ranking.sort_values(["保守勝率(%)", "平均報酬(%)"], ascending=False).head(bt_top_n).reset_index(drop=True)
+        ranking["同訊號勝率"] = [
+            f"{same_status_stats.loc[s, 'mean']:.0%} ({int(same_status_stats.loc[s, 'size'])}次)"
+            if s in same_status_stats.index else "無紀錄"
+            for s in ranking["代碼"]
+        ]
+        ranking["停利目標"] = (ranking["收盤價"] * (1 + bt_take_profit)).round(2)
+
+        overall_win = bt_trades["win"].mean() * 100
+        col_a, col_b, col_c = st.columns(3)
+        col_a.metric("全宇宙基準勝率", f"{overall_win:.1f}%", help="所有成分股全部訊號的平均勝率")
+        col_b.metric("Top 平均勝率", f"{ranking['勝率(%)'].mean():.1f}%" if not ranking.empty else "-",
+                     delta=f"{ranking['勝率(%)'].mean() - overall_win:+.1f}%" if not ranking.empty else None)
+        col_c.metric("回測總交易筆數", f"{len(bt_trades):,}")
+
+        if ranking.empty:
+            st.warning(f"今日有訊號的標的中，沒有交易次數達 {bt_min_trades} 次以上者。請調降「最少訊號次數」。")
+        else:
+            st.dataframe(
+                ranking[["代碼", "名稱", "狀態", "勝率(%)", "保守勝率(%)", "交易次數", "平均報酬(%)",
+                         "盈虧比", "同訊號勝率", "收盤價", "建議停損點", "停利目標", "持有ETF"]],
+                column_config={
+                    "代碼": st.column_config.TextColumn("代碼", width="small"),
+                    "名稱": st.column_config.TextColumn("名稱", width="small"),
+                    "勝率(%)": st.column_config.ProgressColumn("勝率", format="%.1f %%", min_value=0, max_value=100),
+                    "保守勝率(%)": st.column_config.NumberColumn("保守勝率", format="%.1f %%"),
+                    "平均報酬(%)": st.column_config.NumberColumn("每筆平均報酬", format="%+.2f %%"),
+                    "盈虧比": st.column_config.NumberColumn("盈虧比", format="%.2f"),
+                },
+                width="stretch",
+                hide_index=True
+            )
+            st.caption("⚠️ 回測勝率為歷史統計，不代表未來績效；個股樣本數有限，請搭配停損紀律使用。")
